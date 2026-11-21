@@ -630,8 +630,25 @@ class sts2_MCTS:
         node_b = children_sorted[-2]
 
         # ensure enough visits have been made
-        if node_a.visits <= 30 or node_b.visits <= 30:
+        if node_a.visits <= 30:
             return None
+        if node_b.visits <= 30:
+            # the rivals were given up on early (the tree stopped visiting what it rates far below): the leader is the answer when it is ahead of
+            # every one of them by Z_SCORE standard errors, a rival with few visits taking the leader's own variance
+            n_a = node_a.visits
+            S_a, Q_a = node_a.total_reward, node_a.total_reward_squared
+            s_a = max(0.0, (Q_a - S_a**2 / n_a) / (n_a - 1))
+            for rival in self._root_node.children:
+                if rival is node_a:
+                    continue
+                if rival.visits == 0:
+                    return None
+                n_r = rival.visits
+                s_r = max(0.0, (rival.total_reward_squared - rival.total_reward**2 / n_r) / (n_r - 1)) if n_r > 1 else 0.0
+                se = math.sqrt(s_a / n_a + max(s_r, s_a) / n_r)
+                if not (S_a / n_a - rival.total_reward / n_r) > Z_SCORE * se:
+                    return None
+            return "BEST"
 
         # calculate variance (sample variance)
         n_a = node_a.visits
