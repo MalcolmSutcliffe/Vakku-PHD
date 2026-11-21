@@ -171,5 +171,9 @@
   "VAKKU_PHD-SAVE_LAST_FIGHT.hover.desc": "Saves the last fight (your deck, relics, HP, the enemies, the search's choices and any errors) to one readable file and opens its folder. Nothing is sent: attach the file to your bug report.",
   "VAKKU_PHD-SAVE_REPORT.title": "Save report",
   "VAKKU_PHD-SHOW_FIGHT_BUTTON.title": "Show report button in fights",
-  "VAKKU_PHD-SHOW_FIGHT_BUTTON.hover.desc": "Adds a 'Save fight report' button to the combat screen while you hold the Whispering Earring. Takes effect from the next fight."
+  "VAKKU_PHD-SHOW_FIGHT_BUTTON.hover.desc": "Adds a 'Save fight report' button to the combat screen while you hold the Whispering Earring. Takes effect from the next fight.",
+  "VAKKU_PHD-THINKING_BUBBLE.title": "Thinking bubble",
+  "VAKKU_PHD-THINKING_BUBBLE.hover.desc": "Vakku says 'Thinking...' above the Earring when its search takes more than a second.",
+  "VAKKU_PHD-DEBUG_SCREEN.title": "Debug screen",
+  "VAKKU_PHD-DEBUG_SCREEN.hover.desc": "While the Earring thinks, each card in your hand and the End Turn button show the share of the search's visits it has, updated every frame. The card with the most visits is played."
 }

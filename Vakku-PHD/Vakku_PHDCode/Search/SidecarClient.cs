@@ -62,6 +62,20 @@ public static class SidecarClient
         return new Reply(root.GetProperty("action").Clone(), root.TryGetProperty("stats", out var s) ? s.Clone() : default, warnings, text);
     }
 
+    /// <summary>The root moves of the search under way and their visits so far, or null when it cannot be read.</summary>
+    public static async Task<JsonElement?> Progress()
+    {
+        if (_process == null || _failed) return null;
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+            string text = await Http.GetStringAsync($"{_process.BaseUrl}/progress", cts.Token);
+            using var doc = JsonDocument.Parse(text);
+            return doc.RootElement.GetProperty("children").Clone();
+        }
+        catch { return null; }
+    }
+
     public static async Task FightOver()
     {
         if (_process == null || _failed) return;

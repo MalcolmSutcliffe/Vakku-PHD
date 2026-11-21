@@ -6,6 +6,7 @@ public sealed class ModSettings
     public static ModSettings Current => new();
 
     public string Mode => VakkuConfig.ObserveOnly ? "observe" : "play";
+    public bool ThinkingBubble => VakkuConfig.ThinkingBubble;
     public bool ExtraEnergy => VakkuConfig.ExtraEnergy;
     public bool EveryTurn => VakkuConfig.EveryTurn;
     public double SearchSeconds => VakkuConfig.SearchSeconds;

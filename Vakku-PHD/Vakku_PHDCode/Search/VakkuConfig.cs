@@ -12,6 +12,7 @@ public class VakkuConfig : SimpleModConfig
     [ConfigSlider(0.25, 5, 0.25, Format = "{0:0.00} s")]
     public static double SearchSeconds { get; set; } = 1.0;
     public static bool ObserveOnly { get; set; } = false;
+    public static bool ThinkingBubble { get; set; } = true;
 
     [ConfigSection("Potions")]
     public static bool UsePotions { get; set; } = false;
@@ -251,5 +252,6 @@ public class VakkuConfig : SimpleModConfig
     [ConfigSlider(0, 1000, 50, Format = "{0}")]
     public static int PairedScenarios { get; set; } = 300;
     public static bool ShowFightButton { get; set; } = false;
+    public static bool DebugScreen { get; set; } = false;
 
 }

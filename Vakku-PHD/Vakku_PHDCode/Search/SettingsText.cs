@@ -10,24 +10,30 @@ namespace Vakku_PHD.Vakku_PHDCode.Search;
 /// </summary>
 public static class SettingsText
 {
-    public static string FilePath => Path.Combine(Path.GetDirectoryName(typeof(SettingsText).Assembly.Location)!, "localization", "eng", "settings_ui.json");
+    /// <summary>Files in localization/eng/ and the game text table each one is merged into.</summary>
+    public static readonly string[] Tables = { "settings_ui", "relics" };
+
+    public static string FilePath(string table) => Path.Combine(Path.GetDirectoryName(typeof(SettingsText).Assembly.Location)!, "localization", "eng", table + ".json");
 
 
     public static void Merge()
     {
-        try
+        if (LocManager.Instance == null) { MainFile.Logger.Info("settings text: no LocManager yet"); return; }
+        foreach (var name in Tables)
         {
-            if (LocManager.Instance == null) { MainFile.Logger.Info("settings text: no LocManager yet"); return; }
-            if (!File.Exists(FilePath)) { MainFile.Logger.Warn($"settings text: {FilePath} not found"); return; }
-            var text = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(FilePath));
-            if (text == null) return;
-            var table = LocManager.Instance.GetTable("settings_ui");
-            table.MergeWith(text);
-            MainFile.Logger.Info($"settings text: merged {text.Count} entries, table now has VAKKU_PHD.mod_title = {table.HasEntry("VAKKU_PHD.mod_title")} (language {LocManager.Instance.Language})");
-        }
-        catch (Exception e)
-        {
-            MainFile.Logger.Warn($"settings text not merged: {e.Message}");
+            try
+            {
+                if (!File.Exists(FilePath(name))) { MainFile.Logger.Warn($"settings text: {FilePath(name)} not found"); continue; }
+                var text = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(FilePath(name)));
+                if (text == null) continue;
+                var table = LocManager.Instance.GetTable(name);
+                table.MergeWith(text);
+                MainFile.Logger.Info($"settings text: merged {text.Count} entries into {name} (language {LocManager.Instance.Language})");
+            }
+            catch (Exception e)
+            {
+                MainFile.Logger.Warn($"settings text not merged into {name}: {e.Message}");
+            }
         }
     }
 }

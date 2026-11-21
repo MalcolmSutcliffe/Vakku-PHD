@@ -11,6 +11,7 @@ using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.Models.Relics;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.Nodes.Vfx;
+using MegaCrit.Sts2.Core.Helpers;
 
 namespace Vakku_PHD.Vakku_PHDCode.Search;
 
@@ -39,6 +40,7 @@ public static class EarringPlayPatch
         LastFight.Begin(combatState);
         int cardsPlayed = 0;
         bool hitCap;
+        var thinking = new Thinking(earring.Owner.Creature, settings.ThinkingBubble);
         using (CardSelectCmd.PushSelector(new VakuuCardSelector()))
         {
             int startTurn = earring.Owner.PlayerCombatState.TurnNumber;
@@ -59,7 +61,7 @@ public static class EarringPlayPatch
                 {
                     try
                     {
-                        (card, potion, target, endTurn) = await Choose(player, settings);
+                        (card, potion, target, endTurn) = await Choose(player, settings, thinking);
                         if (settings.Mode == "observe")
                         {
                             MainFile.Logger.Info($"[observe] search would play {card?.Id.Entry ?? potion?.Id.Entry ?? "end turn"}");
@@ -91,6 +93,8 @@ public static class EarringPlayPatch
             }
             hitCap = cardsPlayed >= MaxCards;
         }
+        await thinking.Done();
+        DebugOverlay.Clear();
         if (cardsPlayed > 0)
         {
             var line = hitCap ? new LocString("relics", "WHISPERING_EARRING.warning") : new LocString("relics", "WHISPERING_EARRING.approval");
@@ -105,11 +109,13 @@ public static class EarringPlayPatch
     }
 
     /// <summary>Asks the sidecar for the next card. A null card with endTurn false means "no usable answer".</summary>
-    private static async Task<(CardModel?, PotionModel?, Creature?, bool)> Choose(Player player, ModSettings settings)
+    private static async Task<(CardModel?, PotionModel?, Creature?, bool)> Choose(Player player, ModSettings settings, Thinking thinking)
     {
         var state = CombatSnapshot.Build(player);
         var clock = System.Diagnostics.Stopwatch.StartNew();
-        var reply = await SidecarClient.Search(state, settings);
+        var searching = SidecarClient.Search(state, settings);
+        _ = DebugOverlay.Follow(searching, player);
+        var reply = await thinking.Wait(searching);
         long ms = clock.ElapsedMilliseconds;
         LastFight.Record(state, reply.Raw);
         foreach (var warning in reply.Warnings) MainFile.Logger.Warn($"[sidecar] {warning}");
@@ -161,6 +167,49 @@ public static class EarringPlayPatch
         else if (potion.TargetType is TargetType.Self or TargetType.AnyPlayer or TargetType.AnyAlly)
             target = player.Creature;
         return (null, potion, target, false);
+    }
+
+    /// <summary>"Thinking..." above the Earring's owner once the searches of this turn have taken more than a second; gone when the Earring is done.</summary>
+    private sealed class Thinking
+    {
+        private const double AfterSeconds = 1.0;
+        private readonly Creature _speaker;
+        private readonly bool _enabled;
+        private readonly System.Diagnostics.Stopwatch _clock = new();
+        private NSpeechBubbleVfx? _bubble;
+
+        public Thinking(Creature speaker, bool enabled) { _speaker = speaker; _enabled = enabled; }
+
+        public async Task<T> Wait<T>(Task<T> search)
+        {
+            _clock.Start();
+            try
+            {
+                if (_enabled && _bubble == null)
+                {
+                    var wait = TimeSpan.FromSeconds(Math.Max(0.0, AfterSeconds - _spent));
+                    if (await Task.WhenAny(search, Task.Delay(wait)) != search && !_speaker.IsDead)
+                        _bubble = TalkCmd.Play(new LocString("relics", "VAKKU_PHD.thinking"), _speaker, VfxColor.Purple, VfxDuration.Forever);
+                }
+                return await search;
+            }
+            finally
+            {
+                _clock.Stop();
+                _spent += _clock.Elapsed.TotalSeconds;
+                _clock.Reset();
+            }
+        }
+
+        private double _spent;
+
+        public async Task Done()
+        {
+            var bubble = _bubble;
+            _bubble = null;
+            if (bubble != null && Godot.GodotObject.IsInstanceValid(bubble))
+                await bubble.AnimOut();
+        }
     }
 
     private static string Summary(JsonElement stats)
