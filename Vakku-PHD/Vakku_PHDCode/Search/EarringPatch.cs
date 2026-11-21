@@ -9,6 +9,7 @@ using MegaCrit.Sts2.Core.GameActions.Multiplayer;
 using MegaCrit.Sts2.Core.Localization;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.Models.Relics;
+using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.Nodes.Vfx;
 
 namespace Vakku_PHD.Vakku_PHDCode.Search;
@@ -48,20 +49,21 @@ public static class EarringPlayPatch
                 if (CombatManager.Instance.IsPlayerReadyToEndTurn(player)) break;
                 if (earring.Owner.PlayerCombatState.TurnNumber != startTurn) break;
                 var pile = PileType.Hand.GetPile(earring.Owner);
-                if (!pile.Cards.Any(c => c.CanPlay())) break;
+                if (!settings.UsePotions && !pile.Cards.Any(c => c.CanPlay())) break;
 
                 CardModel? card = null;
+                PotionModel? potion = null;
                 Creature? target = null;
                 bool endTurn = false;
                 if (searchWorks)
                 {
                     try
                     {
-                        (card, target, endTurn) = await Choose(player, settings);
+                        (card, potion, target, endTurn) = await Choose(player, settings);
                         if (settings.Mode == "observe")
                         {
-                            MainFile.Logger.Info($"[observe] search would play {card?.Id.Entry ?? "end turn"}");
-                            card = null; endTurn = false;
+                            MainFile.Logger.Info($"[observe] search would play {card?.Id.Entry ?? potion?.Id.Entry ?? "end turn"}");
+                            card = null; potion = null; endTurn = false;
                         }
                     }
                     catch (Exception e)
@@ -72,6 +74,11 @@ public static class EarringPlayPatch
                 }
                 if (endTurn) break;
                 if (CombatManager.Instance.IsOverOrEnding) break;     // the search took time: the fight may have moved on
+                if (potion != null)
+                {
+                    await potion.OnUseWrapper(choiceContext, target);
+                    continue;
+                }
                 if (card == null)
                 {
                     card = pile.Cards.FirstOrDefault(c => c.CanPlay());
@@ -97,7 +104,7 @@ public static class EarringPlayPatch
     }
 
     /// <summary>Asks the sidecar for the next card. A null card with endTurn false means "no usable answer".</summary>
-    private static async Task<(CardModel?, Creature?, bool)> Choose(Player player, ModSettings settings)
+    private static async Task<(CardModel?, PotionModel?, Creature?, bool)> Choose(Player player, ModSettings settings)
     {
         var state = CombatSnapshot.Build(player);
         var clock = System.Diagnostics.Stopwatch.StartNew();
@@ -110,8 +117,9 @@ public static class EarringPlayPatch
         var handNow = PileType.Hand.GetPile(player).Cards.Select(c => c.Id.Entry);
         int sims = reply.Stats.ValueKind == JsonValueKind.Object && reply.Stats.TryGetProperty("num_sims", out var ns) && ns.ValueKind == JsonValueKind.Number ? ns.GetInt32() : -1;
         MainFile.Logger.Info($"search ({ms} ms, {sims} sims): {reply.Action} hand=[{string.Join(", ", handNow)}] energy={player.PlayerCombatState.Energy} {Summary(reply.Stats)}");
-        if (kind == "end_turn") return (null, null, true);
-        if (kind != "play_card") throw new InvalidDataException($"search answered {kind}; only cards are played here");
+        if (kind == "end_turn") return (null, null, null, true);
+        if (kind == "use_potion") return UsePotion(player, reply.Action);
+        if (kind != "play_card") throw new InvalidDataException($"search answered {kind}; only cards and potions are used here");
 
         int index = reply.Action.GetProperty("card_index").GetInt32();
         var hand = PileType.Hand.GetPile(player).Cards;
@@ -131,7 +139,27 @@ public static class EarringPlayPatch
             target = player.Creature;
         else if (card.TargetType == TargetType.AnyAlly)
             target = VanillaTarget(null, card, player.Creature.CombatState!, player);
-        return (card, target, false);
+        return (card, null, target, false);
+    }
+
+    private static (CardModel?, PotionModel?, Creature?, bool) UsePotion(Player player, JsonElement action)
+    {
+        int slot = action.GetProperty("slot").GetInt32();
+        if (slot < 0 || slot >= player.PotionSlots.Count) throw new InvalidDataException($"potion slot {slot} does not exist");
+        var potion = player.GetPotionAtSlotIndex(slot) ?? throw new InvalidDataException($"no potion in slot {slot}");
+        if (potion.IsQueued || !potion.PassesCustomUsabilityCheck) throw new InvalidDataException($"{potion.Id.Entry} cannot be used now");
+
+        Creature? target = null;
+        if (potion.TargetType == TargetType.AnyEnemy)
+        {
+            var enemies = CombatSnapshot.LivingEnemies(player);
+            int t = action.TryGetProperty("target", out var tj) && tj.ValueKind == JsonValueKind.Number ? tj.GetInt32() : -1;
+            if (t < 0 || t >= enemies.Count) throw new InvalidDataException($"target {t} is not a living enemy");
+            target = enemies[t];
+        }
+        else if (potion.TargetType is TargetType.Self or TargetType.AnyPlayer or TargetType.AnyAlly)
+            target = player.Creature;
+        return (null, potion, target, false);
     }
 
     private static string Summary(JsonElement stats)

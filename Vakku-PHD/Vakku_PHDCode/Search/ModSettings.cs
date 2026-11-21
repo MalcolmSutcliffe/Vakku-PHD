@@ -10,6 +10,7 @@ public sealed class ModSettings
     public bool EveryTurn => VakkuConfig.EveryTurn;
     public double SearchSeconds => VakkuConfig.SearchSeconds;
     public bool UsePotions => VakkuConfig.UsePotions;
+    public bool PotionsOnlyInDanger => VakkuConfig.PotionsOnlyInDanger;
     public int PairedScenarios => VakkuConfig.PairedScenarios;
 
     /// <summary>The search settings the sidecar takes by name.</summary>
@@ -28,6 +29,11 @@ public sealed class ModSettings
             ["goopy_growth_hp"] = VakkuConfig.GoopyGrowthHp,
             ["paired_scenarios"] = PairedScenarios,
         };
+        if (UsePotions)
+        {
+            settings["gated"] = PotionsOnlyInDanger;
+            settings["potion_prices"] = VakkuConfig.PotionPriceTable();
+        }
         if (OperatingSystem.IsWindows()) settings["check_workers"] = 1;     // no fork there
         return settings;
     }
