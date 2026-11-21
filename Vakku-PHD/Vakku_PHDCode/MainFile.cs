@@ -2,7 +2,6 @@ using System.Reflection;
 using Godot;
 using HarmonyLib;
 using MegaCrit.Sts2.Core.Modding;
-using Vakku_PHD.Vakku_PHDCode.Sidecar;
 
 namespace Vakku_PHD.Vakku_PHDCode;
 
@@ -25,22 +24,8 @@ public partial class MainFile : Node
 
         harmony.PatchAll(assembly);
 
-        _ = Task.Run(SmokeTestSidecar);
-    }
-
-    /// <summary>Temporary: proves a mod can launch a bundled process and talk to it. Replaced by the real sidecar manager.</summary>
-    private static async Task SmokeTestSidecar()
-    {
-        try
-        {
-            using var sidecar = new SidecarProcess();
-            string reply = await sidecar.StartAsync(TimeSpan.FromSeconds(10));
-            Logger.Info($"SIDECAR SMOKE TEST OK on port {sidecar.Port}: {reply}");
-            await Task.Delay(Timeout.Infinite);     // keep it alive for the life of the game; ProcessExit stops it
-        }
-        catch (Exception e)
-        {
-            Logger.Error($"SIDECAR SMOKE TEST FAILED: {e}");
-        }
+        Search.SettingsText.Merge();
+        BaseLib.Config.ModConfigRegistry.Register(ModId, new Search.VakkuConfig());
+        _ = Search.SidecarClient.EnsureStarted();       // start it now so the first fight does not wait for it
     }
 }

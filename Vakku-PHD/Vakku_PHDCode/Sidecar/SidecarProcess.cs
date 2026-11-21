@@ -18,7 +18,7 @@ public sealed class SidecarProcess : IDisposable
     /// <summary>The folder the sidecar was shipped in: next to the mod's DLL.</summary>
     public static string SidecarDir => Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location)!, "sidecar");
 
-    private static string LauncherName => OperatingSystem.IsWindows() ? "hello.cmd" : "hello";
+    private static string LauncherName => OperatingSystem.IsWindows() ? "run.cmd" : "run";
 
     private static int FreePort()
     {
@@ -53,6 +53,8 @@ public sealed class SidecarProcess : IDisposable
             RedirectStandardError = true,
             CreateNoWindow = true,
         };
+        // Steam's 32-bit overlay is preloaded into every process the game starts; the sidecar is 64-bit and only gets warnings from it.
+        info.Environment.Remove("LD_PRELOAD");
         _process = Process.Start(info) ?? throw new InvalidOperationException("Process.Start returned null");
         _process.OutputDataReceived += (_, e) => { if (e.Data != null) MainFile.Logger.Info($"[sidecar] {e.Data}"); };
         _process.ErrorDataReceived += (_, e) => { if (e.Data != null) MainFile.Logger.Warn($"[sidecar] {e.Data}"); };

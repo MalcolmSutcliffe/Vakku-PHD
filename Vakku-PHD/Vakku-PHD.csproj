@@ -100,13 +100,20 @@
         <Copy SourceFiles="$(TargetDir)$(TargetName).pdb" DestinationFolder="$(ModsPath)$(MSBuildProjectName)/" />
     </Target>
 
-    <!-- The stand-in sidecar ships beside the DLL. On Linux the executable bit is stripped on purpose: a Workshop download may not keep it, and the mod must cope. -->
+    <!-- The sidecar bundle (tools/build_sidecar.sh) ships beside the DLL. On Linux the executable bit is stripped on purpose: a Workshop download may not keep it, and the mod must cope. -->
+    <Target Name="CopyLocalizationToModsFolder" AfterTargets="CopyToModsFolderOnBuild">
+        <ItemGroup>
+            <LocFiles Include="Vakku_PHD/localization/**/*" />
+        </ItemGroup>
+        <Copy SourceFiles="@(LocFiles)" DestinationFolder="$(ModsPath)$(MSBuildProjectName)/localization/%(RecursiveDir)" />
+    </Target>
+
     <Target Name="CopySidecarToModsFolder" AfterTargets="CopyToModsFolderOnBuild">
         <ItemGroup>
             <SidecarFiles Include="sidecar/**/*" />
         </ItemGroup>
         <Copy SourceFiles="@(SidecarFiles)" DestinationFolder="$(ModsPath)$(MSBuildProjectName)/sidecar/%(RecursiveDir)" />
-        <Exec Condition="'$(IsLinux)' == 'true' Or '$(IsOSX)' == 'true'" Command="chmod -x &quot;$(ModsPath)$(MSBuildProjectName)/sidecar/hello&quot;" />
+        <Exec Condition="'$(IsLinux)' == 'true' Or '$(IsOSX)' == 'true'" Command="chmod -x &quot;$(ModsPath)$(MSBuildProjectName)/sidecar/run&quot;" />
     </Target>
 
     <Target Name="CopyQuickPck" AfterTargets="PackPck" Condition="Exists('$(PckPackerOutputPath)') And '$(PckPackerSkipped)' != 'true'">
