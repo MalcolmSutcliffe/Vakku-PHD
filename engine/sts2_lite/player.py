@@ -1,0 +1,698 @@
+from __future__ import annotations
+import re
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from sts2_lite.combat import Player
+
+from sts2_lite import rng
+from sts2_lite.creature import Creature
+from sts2_lite.card import Card, CardId, CardType, CardKeyword, TargetType, CONFUSED_MAX_COST, EnchantmentId, SLITHER_MAX_COST, PLAIN_DAMAGE
+from sts2_lite.card.tables import combat_cards
+
+BASIC_ATTACK_COSTS = {CardId.STRIKE_DEFECT: 1, CardId.STRIKE_IRONCLAD: 1, CardId.BASH: 2, CardId.STRIKE_SILENT: 1, CardId.STRIKE_NECROBINDER: 1, CardId.STRIKE_REGENT: 1}      # the starter Attacks are not in the generated-card table
+from sts2_lite.status import StatusInstance, StatusId, INSTANCED
+from sts2_lite.relic import RelicId, RelicInstance, strength_received, lizard_tail_revive, hand_draw_bonus, blocks_draw, free_by_relic
+from sts2_lite.potion import Potion, PotionId, DEFAULT_POTION_SLOTS, FAIRY_HEAL
+
+SOVEREIGN_BLADE_DAMAGE = 10
+GHOST_SEED_CARDS = frozenset({CardId.STRIKE_IRONCLAD, CardId.DEFEND_IRONCLAD})     # Basic rarity, Strike or Defend tag
+
+from operator import attrgetter
+_CARD_ID, _RESTORE_COST, _BOUND = attrgetter("card_id"), attrgetter("restore_cost"), attrgetter("bound")
+_STOMP = CardId.STOMP
+
+
+class Player(Creature):
+    plating_at_turn_start = False
+    hand : list[Card]
+    draw_pile : list[Card]
+    discard_pile : list[Card]
+    exhaust_pile : list[Card]
+    relics : dict[RelicId, RelicInstance]      # relics with an effect in combat
+    cards_drawn : int       # running total of cards drawn
+    unknown_draws : int     # running total of draws and top-card plays the agent could not foresee; compare before and after an action
+    inferno_plays : int      # times Inferno has been played this combat: its HP loss each turn
+    shuffle_hook = None      # called when the discard pile is shuffled into the draw pile (set by the simulator)
+    draw_hook = None         # called with each card drawn into the hand (set by the simulator for Hellraiser)
+    draw_pause_hook = None   # called after each card drawn with the draws still to make: True when a card choice is waiting, so the rest of the draw waits for it (set by the simulator)
+    counts_hits = False         # a Beat into Shape is in the deck: enemies keep count of the Attacks that hit them this turn
+    generated_hook = None       # called with each card made up in the fight (AfterCardGeneratedForCombat)
+    block_cleared_hook = None    # called after block is cleared, before the hand draw (AfterBlockCleared)
+    known_top : int         # how many cards at the end of draw_pile (the top) the agent knows the identity and order of
+    cards_exhausted_this_turn : int
+    gold : int              # Player.Gold; spent in combat by Seal of Gold
+    potions : list[Potion]  # the potions held, each with the slot the game keeps it in
+    potion_slots : int      # how many the player can carry (Entropic Brew fills the free ones)
+    extra_turn_pending : bool       # Ambergris: an extra turn is taken when this one ends
+
+    def add_growth(self, card : str):
+        self.permanent_growths[card] = self.permanent_growths.get(card, 0) + 1
+
+    def __init__(self):
+        super().__init__()
+        self.hand = []
+        self.draw_pile = []
+        self.discard_pile = []
+        self.exhaust_pile = []
+        self.relics = {}
+        self.cards_drawn = 0
+        self.unknown_draws = 0
+        self.known_top = 0
+        self.inferno_plays = 0
+        self.cards_played_total = 0     # finished plays this combat (Gold Axe)
+        self.crimson_mantle_plays = 0   # Crimson Mantle self-damage per turn
+        self.attacks_played_this_turn = 0
+        self.skills_played_this_turn = 0  # Pinpoint
+        self.shivs_played_this_turn = 0   # Phantom Blades
+        self.discards_this_turn = 0       # cards discarded by effects this turn (Memento Mori)
+        self.stars = 0                    # the Regent's resource (PlayerCombatState.Stars): kept between turns, spent by cards
+        self.stars_spent_this_turn = 0    # Stars spent this turn (cards that count them)
+        self.stars_gained_this_turn = 0   # Radiate
+        self.cards_generated = 0          # cards made up in this fight (Supermassive)
+        self.character = "IRONCLAD"       # whose card pool combat effects generate from (Character.CardPool)
+        self.nightmares = []              # (card, copies) Nightmare picked: they join the hand before the next hand draw
+        self.plays_started_this_turn = 0  # Attack and Skill plays begun this turn, replays and auto-plays included (Nostalgia)
+        self.returning = []               # (card id, upgraded) of the Bolas and Thrumming Hatchets played this turn: back in the hand next turn
+        self.card_blocks_this_turn = 0    # block gains from cards, for Unmovable
+        self.block_play = None            # play_id of the latest card block gain
+        self.block_play_gains = 0         # gains made by that play
+        self.cards_exhausted_this_turn = 0
+        self.gold = 0
+        self.gold_returned = 0      # gold the fight itself will hand back as a reward (a killed Fat Gremlin's Heist): not in `gold` until the fight is won
+        self.permanent_growths = {}  # card (THE_SCYTHE, GENETIC_ALGORITHM, GOOPY) -> plays in this search that grew its deck version for good
+        self.cards_stolen = 0       # cards a Thieving Hopper took in this search, minus the ones returned by killing one that carried one
+        self.potions = []
+        self.potion_slots = DEFAULT_POTION_SLOTS
+        self.extra_turn_pending = False
+        self.binding = False            # Chains of Binding is binding the cards drawn (the player's turn)
+        self.bound_cards = 0            # cards bound so far this turn
+        self.bound_played = False       # a Bound card has been played this turn: no other can be
+        self.smogged = False            # Smoggy: a Skill was played this turn, so every Skill card is afflicted with Smog until it ends
+        self.osty = None                # the Necrobinder's pet (osty.Osty), dead with 0 HP once it has fallen
+        self.osty_attacks_this_turn = 0 # Attacks Osty has made this turn (Flatten, Rattle)
+        self.extra_draws_this_turn = 0  # cards drawn outside the hand draw this turn (Parse)
+        self.doom_applied_this_turn = False
+        self.ethereal_plays = 0         # Ethereal cards played this combat (Banshee's Cry, Big Hat)
+        self.deck_buffs = {}            # deck position -> the growth The Scythe has gained there (the deck's version keeps it after the fight)
+        self.orbs = []                  # the Defect's orb queue (orbs.Orb), the first one is evoked next
+        self.orb_slots = 0              # how many orbs the queue holds
+        self.lightning_channeled = 0    # Lightning orbs channeled this combat (Voltaic)
+        self.energy_spent_this_turn = 0 # Energy cards were paid with this turn (Helix Drill)
+        self.series_this_turn = 0       # cards played this turn, replays not counted (Echo Form)
+        self.statuses_drawn_this_turn = 0   # Iteration
+        self.zero_cost_attacks_this_turn = 0    # Feral
+
+    @classmethod
+    def from_dict(cls, player : dict):
+        pl = cls()
+        pl.max_hp = player["max_hp"]
+        from sts2_lite.character import character_of_title
+        pl.character = character_of_title(player.get("character"))
+        pl.current_hp = player["hp"]
+        pl.block = player["block"]
+        pl.gold = player.get("gold", 0)
+        pl.stars = int(player.get("stars") or 0)
+        osty = player.get("osty")
+        if osty is not None:                # the Necrobinder's pet (BridgeMod reports it once summoned; hp 0 when dead)
+            from sts2_lite.osty import new_osty
+            pl.osty = new_osty(int(osty.get("max_hp", 1)))
+            pl.osty.current_hp = int(osty.get("hp", 0)) if osty.get("alive", True) else 0
+            pl.osty.owner = pl
+        pl.potions = [Potion(potion_id, p.get("slot", i)) for i, p in enumerate(player.get("potions") or [])
+                      if (potion_id := PotionId.from_game_id(p.get("id"))) is not None]
+        pl.potion_slots = max(player.get("potion_slots", DEFAULT_POTION_SLOTS), 1 + max((p.slot for p in pl.potions), default=-1))
+        pl.is_minion = False
+        pl.status = {}
+        for s in player["status"]:
+            inst = StatusInstance.from_dict(s)
+            kept = pl.status.get(inst.status_id)
+            if kept is not None and inst.status_id in INSTANCED:        # one entry per copy
+                kept.merge(inst)
+            else:
+                pl.status[inst.status_id] = inst
+        pl.hand = []
+        for card in player["hand"]:
+            pl.hand.append(Card.from_dict(card))
+        pl.draw_pile = []
+        for card in player["draw_pile"]:
+            pl.draw_pile.append(Card.from_dict(card))
+        pl.discard_pile = []
+        for card in player["discard_pile"]:
+            pl.discard_pile.append(Card.from_dict(card))
+        pl.exhaust_pile = [Card.from_dict(card) for card in player.get("exhaust_pile", [])]
+        for relic in map(RelicInstance.from_dict, player.get("relics", [])):
+            if relic is not None:
+                pl.relics[relic.relic_id] = relic
+        pl._read_orbs(player)       # after the status and relics: the shown values have Focus and Infused Core in them
+        if RelicId.GHOST_SEED in pl.relics:
+            pl._apply_ghost_seed()
+        if StatusId.CONFUSED in pl.status:
+            pl._read_confused_stomps()
+        pl.inferno_plays = max(1, round(pl.status_amount(StatusId.INFERNO) / 7.5)) if StatusId.INFERNO in pl.status else 0
+        # copies inferred from block amount (8 or 10 each)
+        pl.crimson_mantle_plays = max(1, round(pl.status_amount(StatusId.CRIMSON_MANTLE) / 9)) if StatusId.CRIMSON_MANTLE in pl.status else 0
+        pl._read_growing_cards()
+        pl.counts_hits = any(c.card_id is CardId.BEAT_INTO_SHAPE for pile in (pl.hand, pl.draw_pile, pl.discard_pile, pl.exhaust_pile) for c in pile)
+        if StatusId.MONOLOGUE in pl.status and pl.status[StatusId.MONOLOGUE].amount > 0:      # its count is the Strength it has given this turn: taken back at the end of the turn
+            pl.status[StatusId.MONOLOGUE_STRENGTH] = StatusInstance(StatusId.MONOLOGUE_STRENGTH, pl.status[StatusId.MONOLOGUE].amount, [])
+        for counter_status in (StatusId.PALE_BLUE_DOT, StatusId.MONOLOGUE):
+            if counter_status in pl.status:       # these show a count of their own, not the power's amount (1)
+                pl.status[counter_status].amount = 1
+        if StatusId.ORBIT in pl.status:           # OrbitPower.DisplayAmount: the Energy still to spend until the next one, 4 - spent % 4
+            shown = min(4, max(1, pl.status[StatusId.ORBIT].amount))
+            pl.status[StatusId.ORBIT] = StatusInstance(StatusId.ORBIT, 1, [[4 - shown, 0]])
+        if StatusId.CHAINS_OF_BINDING in pl.status:         # mid-turn: the cards bound so far are the ones in hand, and the one already played
+            pl.binding = True
+            pl.bound_played = any(c.bound and c.card_id is not None and "BlockedByHook" in (raw.get("unplayable_reason") or "") for c, raw in zip(pl.hand, player["hand"]))
+            pl.bound_cards = sum(c.bound for c in pl.hand) + (1 if pl.bound_played else 0)
+        if StatusId.SMOGGY in pl.status:         # a Skill in hand that the hook blocks: one was played this turn
+            smogged = [c for c, raw in zip(pl.hand, player["hand"])
+                       if c.type == CardType.Skill and not c.bound and "BlockedByHook" in (raw.get("unplayable_reason") or "")]
+            pl.smogged = bool(smogged)
+            for c in smogged:
+                c.is_unplayable = False         # only the Smog: the simulator knows that itself
+        for card, raw in zip(pl.hand, player["hand"]):
+            if card.card_id is CardId.RADIATE:       # the card says how many Stars it counts this turn: "(Hits 3 times)"
+                hits = re.search(r"Hits (\d+) times?", raw.get("description") or "")
+                if hits:
+                    pl.stars_gained_this_turn = int(hits.group(1))
+        for card, raw in zip(pl.hand, player["hand"]):
+            if card.card_id is CardId.PULL_FROM_BELOW:      # "(Hits 2 times)": the Ethereal cards played this combat
+                hits = re.search(r"Hits (\d+) times?", raw.get("description") or "")
+                if hits:
+                    pl.ethereal_plays = max(pl.ethereal_plays, int(hits.group(1)))
+        for power, kind in ((StatusId.FREE_ATTACK, CardType.Attack), (StatusId.FREE_SKILL, CardType.Skill), (StatusId.FREE_POWER, CardType.Power)):
+            if power in pl.status:
+                pl._read_free_attack_costs(kind)
+        if StatusId.FAN_OF_KNIVES in pl.status:
+            pl.fan_shivs()
+        if RelicId.BRILLIANT_SCARF in pl.relics and free_by_relic(pl):
+            pl._read_scarf_costs()
+        elif StatusId.VOID_FORM in pl.status and not any(isinstance(c.energy_cost, int) and c.energy_cost > 0 for c in pl.hand):
+            pl._read_scarf_costs()      # Void Form's free cards show 0 for the whole hand: nothing in it has its own cost on show
+        return pl
+
+    def _read_orbs(self, player : dict):
+        """The Defect's orb queue (the bridge lists each orb with its shown values; a deck-built fight starts with the character's three slots)."""
+        from sts2_lite import orbs
+        self.orb_slots = int(player["orb_slots"]) if player.get("orb_slots") is not None else (orbs.DEFECT_SLOTS if self.character == "DEFECT" else 0)
+        self.orbs = []
+        for raw in player.get("orbs") or []:
+            orb = orbs.orb_from_state(self, raw)
+            if orb is not None:
+                self.orbs.append(orb)
+
+    def _read_confused_stomps(self):
+        """A shown Stomp cost under Confused is the roll (minus Attacks played since the draw), not 3 minus Attacks."""
+        for card in self.hand + self.draw_pile + self.discard_pile + self.exhaust_pile:
+            if card.card_id == CardId.STOMP:
+                card.restore_cost = None
+
+    def _apply_ghost_seed(self):
+        """GhostSeed.CanAffect: basic Strikes and Defends are Ethereal (idempotent if the bridge already sent it)."""
+        for pile in (self.hand, self.draw_pile, self.discard_pile, self.exhaust_pile):
+            for i, c in enumerate(pile):
+                if c.card_id in GHOST_SEED_CARDS:
+                    pile[i] = c.with_keyword(CardKeyword.ETHEREAL)
+
+    def _read_free_attack_costs(self, kind=CardType.Attack):
+        """Free Attack makes the game show every Attack in the hand at 0 (TryModifyEnergyCostInCombatLate), so the shown
+        cost is not the card's own: take that from the card tables. current_cost applies the 0 while the power lasts."""
+        for i, card in enumerate(self.hand):
+            if card.type != kind or card.energy_cost != 0:
+                continue
+            base = BASIC_ATTACK_COSTS.get(card.card_id) if kind == CardType.Attack else None
+            if base is None and card.card_id in combat_cards(self.character):
+                base = Card.create_generated(card.card_id, card.is_upgraded).energy_cost
+            if base is not None and base != 0:
+                own = Card.create_copy(card)
+                own.energy_cost = base
+                self.hand[i] = own
+
+    def _read_scarf_costs(self):
+        """With one more card to play before Brilliant Scarf's free one the game shows every card in the hand at 0, not only the free one:
+        the costs the cards have after that are taken from the card tables (current_cost applies the 0 while the Scarf is due)."""
+        for i, card in enumerate(self.hand):
+            if card.energy_cost != 0:
+                continue
+            base = BASIC_ATTACK_COSTS.get(card.card_id) if card.type == CardType.Attack else None
+            if base is None and card.card_id in combat_cards(self.character):
+                base = Card.create_generated(card.card_id, card.is_upgraded).energy_cost
+            if base is None and card.card_id in (CardId.DEFEND_IRONCLAD, CardId.DEFEND_SILENT, CardId.DEFEND_NECROBINDER, CardId.DEFEND_DEFECT, CardId.DEFEND_REGENT, CardId.SURVIVOR, CardId.SLIMED):
+                base = 1
+            if base not in (None, 0) and base != "X":
+                own = Card.create_copy(card)
+                own.energy_cost = base
+                own.guessed_cost = True
+                self.hand[i] = own
+
+    def _read_growing_cards(self):
+        """Rampage and Thrash remember the damage they gained, which the bridge only shows in the card text.
+        Cards in the hand print their damage with Strength and Weak included, so that is taken back out."""
+        from sts2_lite.damage import base_from_displayed
+        for pile in (self.hand, self.draw_pile, self.discard_pile, self.exhaust_pile):
+            for card in pile:
+                if card.card_id == CardId.GOLD_AXE and card.shown_damage is not None:     # prints one damage per play so far
+                    shown = card.shown_damage
+                    self.cards_played_total = max(self.cards_played_total, base_from_displayed(shown, self, Creature(), card) if pile is self.hand else shown)
+                    continue
+                if card.card_id is CardId.SUPERMASSIVE and card.shown_damage is not None:       # 5 plus 3 (4) for every card made in the fight: the print says how many there were
+                    shown = base_from_displayed(card.shown_damage, self, Creature(), card) if pile is self.hand else card.shown_damage
+                    self.cards_generated = max(self.cards_generated, max(0, (shown - 5) // (4 if card.is_upgraded else 3)))
+                    continue
+                momentum = card.enchantment == EnchantmentId.MOMENTUM and card.card_id in PLAIN_DAMAGE
+                if card.shown_damage is None or not (momentum or card.card_id in (CardId.RAMPAGE, CardId.THRASH, CardId.MAUL, CardId.SOVEREIGN_BLADE, CardId.KINGLY_PUNCH, CardId.THE_SCYTHE, CardId.CLAW, CardId.GENETIC_ALGORITHM)):
+                    continue
+                shown = card.shown_damage
+                if card.card_id == CardId.GENETIC_ALGORITHM:       # block, so Dexterity (not Strength and Weak) is what the print holds
+                    base = shown
+                    if pile is self.hand:       # the print has Dexterity and Frail in it: the largest base that gives it
+                        dexterity, frail = self.status_amount(StatusId.DEXTERITY), StatusId.FRAIL in self.status
+                        base = next((b for b in range(2 * shown + abs(dexterity) + 10, -1, -1)
+                                     if max(0, int((b + dexterity) * (0.75 if frail else 1) + 1e-6)) == shown), shown)
+                    card.bonus_damage = max(0, base - 1)
+                    continue
+                if pile is self.hand:
+                    shown = base_from_displayed(shown, self, Creature(), card)
+                if momentum:     # the text carries the accumulated bonus; the enchantment's X is only the per-play step
+                    card.enchant_bonus = max(0, shown - PLAIN_DAMAGE[card.card_id][card.is_upgraded])
+                elif card.card_id == CardId.RAMPAGE:
+                    step = 10 if card.is_upgraded else 5
+                    card.bonus_damage = max(0, round((shown - 10) / step)) * step
+                elif card.card_id == CardId.MAUL:
+                    card.bonus_damage = max(0, shown - (6 if card.is_upgraded else 5))
+                elif card.card_id == CardId.KINGLY_PUNCH:          # +4 (+6) each draw
+                    card.bonus_damage = max(0, shown - (10 if card.is_upgraded else 8))
+                elif card.card_id == CardId.THE_SCYTHE:            # 13 plus 5 (7) a play
+                    card.bonus_damage = max(0, shown - 13)
+                elif card.card_id == CardId.CLAW:                  # 3 (4) plus the increase of every Claw played
+                    card.bonus_damage = max(0, shown - (4 if card.is_upgraded else 3))
+                elif card.card_id == CardId.SOVEREIGN_BLADE:       # Forge adds to its 10
+                    card.bonus_damage = max(0, shown - SOVEREIGN_BLADE_DAMAGE)
+                else:
+                    card.bonus_damage = max(0, shown - (6 if card.is_upgraded else 4))
+
+    def remove_displayed_cost_modifiers(self):
+        """Borrowed Time adds to every cost the bridge shows, and Veilpiercer shows its Ethereal cards at 0: the base costs come back
+        (Veilpiercer's from the card tables, a guess a later state may correct, see CombatState.carry_card_costs)."""
+        borrowed = self.status_amount(StatusId.BORROWED_TIME)
+        veil = StatusId.VEILPIERCER in self.status
+        if not borrowed and not veil:
+            return
+        known = combat_cards(self.character)
+        for pile in (self.hand, self.draw_pile, self.discard_pile, self.exhaust_pile):
+            for card in pile:
+                if card.energy_cost == "X":
+                    continue
+                if veil and card.ethereal and card.energy_cost == 0 and pile is self.hand:
+                    if card.card_id in known:
+                        base = Card.create_generated(card.card_id, card.is_upgraded).energy_cost
+                        if base != "X" and base != 0:
+                            card.energy_cost, card.guessed_cost = base, True
+                    continue
+                if borrowed:
+                    card.energy_cost = max(0, card.energy_cost - borrowed)
+
+    def remove_displayed_tangled(self):
+        """The bridge shows attack costs with Tangled included; keep base costs."""
+        tangled = self.status_amount(StatusId.TANGLED)
+        if tangled == 0:
+            return
+        for card in self.hand + self.draw_pile + self.discard_pile + self.exhaust_pile:
+            if card.type == CardType.Attack and card.energy_cost != "X":
+                card.energy_cost = max(0, card.energy_cost - tangled)
+
+    @classmethod
+    def deepcopy(cls, player : Player) -> Player:
+        new_pl = cls()
+        new_pl.max_hp = player.max_hp
+        new_pl.current_hp = player.current_hp
+        new_pl.block = player.block
+        new_pl.is_minion = False
+        new_pl.status = {}
+        for s in player.status.values():
+            new_pl.status[s.status_id] = StatusInstance.deepcopy(s)
+        new_pl.hand = []
+        for card in player.hand:
+            new_pl.hand.append(card)
+        new_pl.draw_pile = []
+        for card in player.draw_pile:
+            new_pl.draw_pile.append(card)
+        new_pl.discard_pile = []
+        for card in player.discard_pile:
+            new_pl.discard_pile.append(card)
+        new_pl.exhaust_pile = list(player.exhaust_pile)
+        new_pl.potions = list(player.potions)           # a Potion never changes
+        new_pl.potion_slots = player.potion_slots
+        new_pl.extra_turn_pending = player.extra_turn_pending
+        new_pl.relics = {relic_id: RelicInstance.deepcopy(relic) for relic_id, relic in player.relics.items()}
+        new_pl.cards_drawn = player.cards_drawn
+        new_pl.unknown_draws = player.unknown_draws
+        new_pl.known_top = player.known_top
+        new_pl.inferno_plays = player.inferno_plays
+        new_pl.cards_played_total = player.cards_played_total
+        new_pl.crimson_mantle_plays = player.crimson_mantle_plays
+        new_pl.block_play = player.block_play
+        new_pl.block_play_gains = player.block_play_gains
+        new_pl.cards_exhausted_this_turn = player.cards_exhausted_this_turn
+        new_pl.lost_hp_this_turn = player.lost_hp_this_turn
+        new_pl.has_been_attacked_this_turn = player.has_been_attacked_this_turn
+        new_pl.hp_loss_events = player.hp_loss_events
+        new_pl.hp_lost_log = list(player.hp_lost_log)
+        new_pl.attacks_played_this_turn = player.attacks_played_this_turn
+        new_pl.skills_played_this_turn = player.skills_played_this_turn
+        new_pl.shivs_played_this_turn = player.shivs_played_this_turn
+        new_pl.discards_this_turn = player.discards_this_turn
+        new_pl.stars, new_pl.stars_spent_this_turn = player.stars, player.stars_spent_this_turn
+        new_pl.stars_gained_this_turn, new_pl.cards_generated = player.stars_gained_this_turn, player.cards_generated
+        new_pl.counts_hits = player.counts_hits
+        new_pl.nightmares = list(player.nightmares)
+        new_pl.character = player.character
+        new_pl.plays_started_this_turn = player.plays_started_this_turn
+        new_pl.returning = list(player.returning)
+        new_pl.card_blocks_this_turn = player.card_blocks_this_turn
+        new_pl.gold = player.gold
+        new_pl.gold_returned = player.gold_returned
+        new_pl.cards_stolen = player.cards_stolen
+        new_pl.permanent_growths = dict(player.permanent_growths)
+        new_pl.binding, new_pl.bound_cards, new_pl.bound_played = player.binding, player.bound_cards, player.bound_played
+        new_pl.smogged = player.smogged
+        new_pl.osty = player.osty.copy() if player.osty is not None else None
+        if new_pl.osty is not None:
+            new_pl.osty.owner = new_pl
+        new_pl.osty_attacks_this_turn = player.osty_attacks_this_turn
+        new_pl.extra_draws_this_turn = player.extra_draws_this_turn
+        new_pl.doom_applied_this_turn = player.doom_applied_this_turn
+        new_pl.ethereal_plays = player.ethereal_plays
+        new_pl.deck_buffs = dict(player.deck_buffs)
+        new_pl.orbs = [o.copy() for o in player.orbs]
+        new_pl.orb_slots, new_pl.lightning_channeled = player.orb_slots, player.lightning_channeled
+        new_pl.energy_spent_this_turn, new_pl.series_this_turn = player.energy_spent_this_turn, player.series_this_turn
+        new_pl.statuses_drawn_this_turn, new_pl.zero_cost_attacks_this_turn = player.statuses_drawn_this_turn, player.zero_cost_attacks_this_turn
+        return new_pl
+    
+    def clear_bound(self):
+        """ChainsOfBindingPower.BeforeSideTurnEnd: the affliction goes wherever the cards are."""
+        self.binding, self.bound_cards, self.bound_played = False, 0, False
+        for pile in (self.hand, self.draw_pile, self.discard_pile):
+            if not any(map(_BOUND, pile)):
+                continue
+            for i, c in enumerate(pile):
+                if c.bound:
+                    pile[i] = c.bound_copy(False)
+
+    doom_hook = None            # called with (target, amount) when damage is turned into Doom (Reaper Form; set by the simulator)
+    osty_hurt_hook = None       # called with the HP Osty lost (set by the simulator for Necro Mastery)
+    opening_hook = None
+
+    def turn_start(self):
+        self.bound_cards, self.bound_played = 0, False
+        self.binding = StatusId.CHAINS_OF_BINDING in self.status
+        remnant = self.relics.get(RelicId.BEATING_REMNANT)
+        if remnant is not None:
+            remnant.value = 0       # its damage limit counts from here
+        super().turn_start()
+        self.cards_exhausted_this_turn = 0
+        self.attacks_played_this_turn = 0
+        self.skills_played_this_turn = 0
+        self.shivs_played_this_turn = 0
+        self.discards_this_turn = 0
+        self.osty_attacks_this_turn = 0
+        self.extra_draws_this_turn = 0
+        self.doom_applied_this_turn = False
+        self.plays_started_this_turn = 0
+        self.energy_spent_this_turn = self.series_this_turn = self.statuses_drawn_this_turn = self.zero_cost_attacks_this_turn = 0
+        self.card_blocks_this_turn = 0
+        self.block_play, self.block_play_gains = None, 0
+        if self.block_cleared_hook is not None:
+            self.block_cleared_hook()
+        if self.returning:
+            self.return_played_cards()
+        extra_draw = self.status.pop(StatusId.DRAW_CARDS_NEXT_TURN, None)       # Relax: part of the hand draw
+        clarity = self.status.get(StatusId.CLARITY_EXTRACT)     # Clarity Extract: 1 more card for a few turns
+        if clarity is not None:
+            clarity.amount -= 1
+            if clarity.amount <= 0:
+                del self.status[StatusId.CLARITY_EXTRACT]
+        count = max(0, (5 + hand_draw_bonus(self) if self.relics else 5) + (extra_draw.amount if extra_draw else 0) + (1 if clarity else 0) - self.status_amount(StatusId.MIND_ROT)
+                    + self.status_amount(StatusId.TOOLS_OF_THE_TRADE) + self.status_amount(StatusId.MACHINE_LEARNING) + self.status_amount(StatusId.TYRANNY) + self.status_amount(StatusId.DEMESNE))
+        if self.opening_hook is not None:       # a fight built from a deck: first-turn relics and Innate cards (relic/combat_start.py)
+            hook, self.opening_hook = self.opening_hook, None
+            count = hook(self, count)
+        self.draw_cards(count, from_hand_draw=True)
+
+        if StatusId.CRIMSON_MANTLE in self.status:
+            self.lose_hp(max(1, self.crimson_mantle_plays))
+            self.apply_block(self.status[StatusId.CRIMSON_MANTLE].amount)
+    
+    def return_played_cards(self):
+        """Bolas and Thrumming Hatchet (BeforeHandDraw): the ones played last turn go to the hand from wherever they are."""
+        returning, self.returning = self.returning, []
+        for card_id, upgraded in returning:
+            for pile in (self.discard_pile, self.exhaust_pile, self.draw_pile):
+                card = next((c for c in pile if c.card_id == card_id and c.is_upgraded == upgraded), None)
+                if card is not None:
+                    break
+            else:
+                continue            # already in the hand
+            if len(self.hand) >= 10:
+                continue
+            if pile is self.draw_pile:
+                self.remove_from_draw_pile(card)
+            else:
+                pile.remove(card)
+            self.hand.append(card)
+
+    def add_instance(self, status : StatusId, record : list[int]):
+        """Apply an instanced power: every play is a separate copy with its own state."""
+        inst = self.status.get(status)
+        if inst is None:
+            self.status[status] = StatusInstance(status, record[0], [record])
+        else:
+            inst.records.append(record)
+            inst.sync()
+
+    def apply_status(self, status : StatusId, amount : int, bypass_artifact : bool = False):
+        if status is StatusId.STRENGTH and amount > 0 and self.relics:
+            amount = strength_received(self, amount)
+        super().apply_status(status, amount, bypass_artifact)
+
+    def _lose_hp_from_damage(self, damage : int, dealer, powered : bool):
+        """DieForYouPower: a living Osty takes the unblocked part of an Attack first; what it cannot take goes on to the player."""
+        osty = self.osty
+        if powered and osty is not None and osty.current_hp > 0 and damage > 0:
+            from sts2_lite.osty import hurt_osty
+            damage -= hurt_osty(self, damage)
+            if damage <= 0:
+                return
+        super()._lose_hp_from_damage(damage, dealer, powered)
+
+    def die(self):
+        if self.potions and self._fairy_revive():
+            return
+        if self.relics and lizard_tail_revive(self):
+            return
+        super().die()
+
+    def _fairy_revive(self) -> bool:
+        """Fairy in a Bottle: instead of dying the potion is used up and the player is healed to 30% of Max HP (assumed to come before Lizard Tail)."""
+        fairy = next((p for p in self.potions if p.potion_id == PotionId.FAIRY_IN_A_BOTTLE), None)
+        if fairy is None:
+            return False
+        self.potions.remove(fairy)
+        self.current_hp = max(1, int(self.max_hp * FAIRY_HEAL))
+        return True
+
+    def draw_cards(self, num_cards : int, from_hand_draw : bool = False):
+        for i in range(num_cards):
+            self.draw_card(from_hand_draw)
+            if self.draw_pause_hook is not None and self.draw_pause_hook(num_cards - i - 1, from_hand_draw):
+                return
+
+    def draw_card(self, from_hand_draw : bool = False) -> Card | None:
+        """Draw one card and return it (None if nothing was drawn). Battle Trance and Fiddle stop every draw except the start-of-turn hand."""
+        if not from_hand_draw and (StatusId.NO_DRAW in self.status or (self.relics and blocks_draw(self))):
+            return None
+        if len(self.hand) >= 10:
+            return None
+        if len(self.draw_pile) == 0:
+            if self.shuffle_discard_into_draw() and self.draw_pause_hook is not None:
+                self.draw_pause_hook(1, from_hand_draw)     # the pick the shuffle asked for comes first: this draw waits for it
+                return None
+        if len(self.draw_pile) == 0:
+            return None
+        card = self.draw_pile.pop()
+        if card.enchantment == EnchantmentId.SLITHER and card.energy_cost != "X" and not card.unplayable:
+            card = card.confused_copy(rng.randrange(SLITHER_MAX_COST + 1))     # a new random cost each time it is drawn
+        if StatusId.CONFUSED in self.status and card.energy_cost != "X" and not card.unplayable:
+            card = card.confused_copy(rng.randrange(CONFUSED_MAX_COST + 1))    # Canonical < 0 (Unplayable) and X keep theirs
+        chains = self.status.get(StatusId.CHAINS_OF_BINDING) if self.binding else None
+        if chains is not None and self.bound_cards < chains.amount and not card.bound:
+            card = card.bound_copy()        # ChainsOfBindingPower.AfterCardDrawn: the first few cards drawn each turn
+            self.bound_cards += 1
+        self.hand.append(card)
+        self.cards_drawn += 1
+        if not from_hand_draw:
+            self.extra_draws_this_turn += 1
+        if self.known_top > 0:
+            self.known_top -= 1
+        else:
+            self.unknown_draws += 1
+        if self.draw_hook is not None:
+            self.draw_hook(card, from_hand_draw)
+        return card
+
+    def shuffle_draw_pile(self):
+        """Shuffle the draw pile, leaving the known cards on top where they are."""
+        if self.known_top <= 0:
+            rng.shuffle(self.draw_pile)
+            return
+        split = max(0, len(self.draw_pile) - self.known_top)
+        rest = self.draw_pile[:split]
+        rng.shuffle(rest)
+        self.draw_pile[:split] = rest
+
+    def take_top(self) -> Card | None:
+        """Remove and return the top card of the draw pile (reshuffling an empty pile first) without
+        putting it in the hand. Counts as an unforeseen draw unless the agent knew the card."""
+        if not self.draw_pile:
+            self.shuffle_discard_into_draw()
+        if not self.draw_pile:
+            return None
+        card = self.draw_pile.pop()
+        if self.known_top > 0:
+            self.known_top -= 1
+        else:
+            self.unknown_draws += 1
+        return card
+
+    def add_to_hand(self, card : Card, by_player : bool = True):
+        """A card created mid-fight goes to the hand, or to the discard pile if the hand is full."""
+        if card.card_id == CardId.STOMP and self.attacks_played_this_turn:
+            card = card.cheaper_this_turn(self.attacks_played_this_turn)
+        elif card.card_id == CardId.PINPOINT and self.skills_played_this_turn:
+            card = card.cheaper_this_turn(self.skills_played_this_turn)      # Pinpoint.AfterCardEnteredCombat
+        if len(self.hand) < 10:
+            self.hand.append(card)
+        else:
+            self.discard_pile.append(card)
+        if card.generated:
+            self.cards_generated += 1
+            if card.card_id is CardId.BEAT_INTO_SHAPE:
+                self.counts_hits = True
+            if by_player and self.generated_hook is not None:       # an enemy's card has no creator for the powers that answer it
+                self.generated_hook(card)
+
+    def reduce_stomp_costs(self, card_id : CardId = CardId.STOMP):
+        """Every Stomp, wherever it is, costs 1 less this turn each time an Attack is played (Pinpoint: each time a Skill is played)."""
+        for pile in (self.hand, self.draw_pile, self.discard_pile, self.exhaust_pile):
+            if card_id not in map(_CARD_ID, pile):          # a C-level scan; most piles hold none
+                continue
+            for i, c in enumerate(pile):
+                if c.card_id == card_id and c.energy_cost != 0:
+                    pile[i] = c.cheaper_this_turn(1)
+
+    def fan_shivs(self):
+        """Fan of Knives: every Shiv targets all enemies (Shiv.TargetType)."""
+        for pile in (self.hand, self.draw_pile, self.discard_pile, self.exhaust_pile):
+            for i, c in enumerate(pile):
+                if c.card_id is CardId.SHIV and c.target_type is not TargetType.AllEnemies:
+                    fanned = Card.create_copy(c)
+                    fanned.target_type = TargetType.AllEnemies
+                    pile[i] = fanned
+
+    def clear_turn_keywords(self):
+        """PlayerCombatState.EndOfTurnCleanup: Retain and Sly given for this turn only (Expertise, Hand Trick) are gone after the hand is flushed."""
+        for pile in (self.hand, self.draw_pile, self.discard_pile, self.exhaust_pile):
+            for i, c in enumerate(pile):
+                if c.turn_keywords:
+                    pile[i] = c.without_turn_keywords()
+
+    def restore_free_cards(self):
+        """At the end of the turn cards made free for this turn (Infernal Blade) get their cost back."""
+        for pile in (self.hand, self.draw_pile, self.discard_pile, self.exhaust_pile):
+            if list(map(_RESTORE_COST, pile)).count(None) == len(pile):        # no card of the pile has a cost to get back
+                continue
+            for i, c in enumerate(pile):
+                if c.restore_cost is not None and not (c.lasting and c.until_played):
+                    restored = Card.create_copy(c)
+                    restored.energy_cost, restored.restore_cost, restored.until_played = c.restore_cost, None, False
+                    pile[i] = restored
+
+    def put_on_top(self, card : Card):
+        """Place a card on top of the draw pile; the agent knows what it is."""
+        self.draw_pile.append(card)
+        self.known_top += 1
+
+    def insert_into_draw_pile(self, card : Card, by_player : bool = True):
+        """CardPilePosition.Random: any of the len+1 places. Known top cards below the new card are no longer known
+        (their distance from the top is uncertain); those above it still are."""
+        index = rng.randrange(len(self.draw_pile) + 1)
+        if index >= len(self.draw_pile) - self.known_top:
+            self.known_top = len(self.draw_pile) - index
+        self.draw_pile.insert(index, card)
+        if card.generated:
+            self.cards_generated += 1
+            if by_player and self.generated_hook is not None:       # AfterCardGeneratedForCombat(card, creator): the powers that answer it want the player as creator
+                self.generated_hook(card)
+
+    def remove_from_draw_pile(self, card : Card):
+        """Remove a card from the draw pile, forgetting a known top card if it was one."""
+        index = next((i for i, c in enumerate(self.draw_pile) if c is card), None)
+        if index is None:
+            index = self.draw_pile.index(card)
+        if index >= len(self.draw_pile) - self.known_top:
+            self.known_top -= 1
+        del self.draw_pile[index]
+
+    def shuffle_discard_into_draw(self) -> bool:
+        """True when the shuffle asked for a card choice (Stratagem), which comes before anything else."""
+        if not self.discard_pile:
+            return False
+        self.draw_pile.extend(self.discard_pile)
+        self.discard_pile = []
+        self.known_top = 0
+        self.shuffle_draw_pile()
+        fitted = [c for c in self.draw_pile if c.enchantment == EnchantmentId.PERFECT_FIT]
+        if fitted:      # Perfect Fit: placed on top instead of being shuffled, and the agent knows them
+            self.draw_pile = [c for c in self.draw_pile if c.enchantment != EnchantmentId.PERFECT_FIT] + fitted
+            self.known_top = len(fitted)
+        return self.shuffle_hook is not None and self.shuffle_hook()
+
+    def upgrade_card(self, card : Card) -> Card | None:
+        """Replace a card in the hand or a pile with its upgraded version. Returns it, or None if the card
+        cannot be upgraded or is in none of the piles."""
+        if not card.is_upgradable:
+            return None
+        for pile in (self.hand, self.draw_pile, self.discard_pile, self.exhaust_pile):
+            for i, c in enumerate(pile):
+                if c is card:
+                    pile[i] = card.upgraded_copy()
+                    return pile[i]
+        return None
+
+    def exhaust_card(self, card :Card):
+        # the card being played is in none of the piles
+        if card in self.hand:
+            self.hand.remove(card)
+        elif card in self.draw_pile:
+            self.remove_from_draw_pile(card)
+        elif card in self.discard_pile:
+            self.discard_pile.remove(card)
+        self.exhaust_pile.append(card)
+        self.cards_exhausted_this_turn += 1
+
+    def readable(self) -> str:
+        output = ""
+        output += super().readable()
+        output += "\nHand : \n"
+        for card in self.hand:
+            output += str(card.card_id) + "\n"
+        # output += "Draw : \n"
+        # for card in self.draw_pile:
+        #     output += str(card.card_id) + "\n"
+        # output += "Discard : \n"
+        # for card in self.discard_pile:
+        #     output += str(card.card_id) + "\n"
+        return output

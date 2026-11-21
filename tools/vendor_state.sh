@@ -2,7 +2,7 @@
 # Regenerates Vakku-PHD/Vakku_PHDCode/Search/BridgeStateCopy.cs from the bridge's state builder, so the sidecar
 # gets exactly the combat state the engine is checked against. Run again when the bridge builder changes.
 set -euo pipefail
-BRIDGE="${BRIDGE_SRC:-/home/user/Documents/Malcolm_Stuff/Projects/SlayTheSpireII-Agent/cli-anything-sts2/agent-harness/bridge/plugin}"
+BRIDGE="${BRIDGE_SRC:?set BRIDGE_SRC to the bridge plugin folder (cli-anything-sts2/agent-harness/bridge/plugin)}"
 OUT="$(dirname "$0")/../Vakku-PHD/Vakku_PHDCode/Search/BridgeStateCopy.cs"
 mkdir -p "$(dirname "$OUT")"
 S="$BRIDGE/BridgeMod.StateBuilder.cs"; H="$BRIDGE/BridgeMod.Helpers.cs"

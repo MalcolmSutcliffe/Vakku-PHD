@@ -4,7 +4,7 @@
 set -eu
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 WS="${1:-$HERE/workshop-test}"
-GAME="${STS2_GAME_DIR:-/home/user/snap/steam/common/.local/share/Steam/steamapps/common/Slay the Spire 2}"
+GAME="${STS2_GAME_DIR:-$HOME/snap/steam/common/.local/share/Steam/steamapps/common/Slay the Spire 2}"
 SRC="$GAME/mods/Vakku-PHD"
 [ -f "$SRC/Vakku_PHD.dll" ] || { echo "build the mod first: $SRC/Vakku_PHD.dll is missing" >&2; exit 1; }
 mkdir -p "$WS/content"

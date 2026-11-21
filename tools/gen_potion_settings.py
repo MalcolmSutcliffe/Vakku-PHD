@@ -1,10 +1,10 @@
 """Writes one price slider per potion into VakkuConfig.cs (between the potion-prices markers) and their labels into settings_ui.json.
-Run again when the engine gains a potion:  python3 tools/gen_potion_settings.py [path to the engine's scripts folder]"""
+Run again when the engine gains a potion:  python3 tools/gen_potion_settings.py [engine folder, default engine/]"""
 import json, re, sys
 from pathlib import Path
 
 root = Path(__file__).resolve().parent.parent
-scripts = Path(sys.argv[1] if len(sys.argv) > 1 else "/home/user/Documents/Malcolm_Stuff/Projects/SlayTheSpireII-Agent-autorunner/scripts")
+scripts = Path(sys.argv[1]) if len(sys.argv) > 1 else root / "engine"
 sys.path.insert(0, str(scripts))
 from sts2_lite.potion import PotionId            # noqa: E402
 from agents.sts2_MCTS.params import RewardParams  # noqa: E402

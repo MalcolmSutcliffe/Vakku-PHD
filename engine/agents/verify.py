@@ -1,0 +1,260 @@
+"""Checks a simulated state against the state the game reports, to find places where the engine drifts from the game."""
+from __future__ import annotations
+from collections import Counter
+from typing import TYPE_CHECKING
+
+import re
+
+from sts2_lite.card import CardId, CardType, COLORLESS_CARDS
+from sts2_lite.enemy_moves import HATCHLING_HP, SPAWN_HP, TOUGH_ASCENSION
+from sts2_lite.status import StatusId
+
+if TYPE_CHECKING:
+    from sts2_lite.combat import CombatState
+
+# cards whose result depends on something the bridge hides (the draw order) or on the RNG: what they
+# generate or play cannot be predicted, so their mismatches are tagged rather than trusted
+SHUFFLING_POTIONS = frozenset({"BOTTLED_POTENTIAL", "OROBIC_ACID", "COSMIC_CONCOCTION", "SNECKO_OIL"})       # the shuffle, or cards the game picks at random: not the sim's
+RANDOM_CARDS = frozenset({CardId.INFERNAL_BLADE, CardId.STOKE, CardId.HAVOC, CardId.SEEKER_STRIKE, CardId.JACKPOT, CardId.JACK_OF_ALL_TRADES,
+                          CardId.CATASTROPHE, CardId.BEAT_DOWN, CardId.ANOINTED, CardId.DISCOVERY, CardId.HIDDEN_GEM, CardId.ALCHEMIZE,
+                          CardId.CINDER, CardId.THRASH, CardId.METAMORPHOSIS, CardId.REBOOT})       # Cinder / Thrash exhaust a random card; Reboot shuffles everything and draws
+# random only when not upgraded: the upgrade lets the player choose the card to exhaust
+RANDOM_UNLESS_UPGRADED = frozenset({CardId.TRUE_GRIT})
+
+
+SIM_ONLY_STATUSES = {StatusId.HIT_THIS_TURN, StatusId.MONOLOGUE_STRENGTH}      # Monologue's Strength shows as the power's own count in the game
+
+def _statuses(creature) -> dict[str, int]:
+    return {s.name: inst.shown_amount for s, inst in creature.status.items() if s not in SIM_ONLY_STATUSES}      # counts and markers of the sim's own, not game powers
+
+def _cards(pile) -> Counter:
+    return Counter((c.card_id.name + (f"[{c.enchantment.name}]" if c.enchantment else ""), c.is_upgraded) for c in pile)
+
+def snapshot(cs : CombatState) -> dict:
+    """The comparable parts of a state as plain data (also what a log entry stores)."""
+    p = cs.player
+    return {
+        "round": cs.turn_number,
+        "energy": cs.energy,
+        "stars": p.stars,
+        "player": {"hp": p.current_hp, "max_hp": p.max_hp, "block": p.block, "status": _statuses(p)},
+        "relics": {r.name: {"counter": inst.counter, "used": inst.used} for r, inst in p.relics.items()},
+        "hand": sorted(((c.card_id.name, c.is_upgraded, c.energy_cost, c.enchantment.name if c.enchantment else None, c.star_cost) for c in p.hand),
+                       key=lambda t : (t[0], t[1], str(t[2]), t[3] or "", str(t[4]))),          # identical cards differ in cost "X" or in an enchantment: None and a name do not compare
+        "draw": sorted(f"{i}{'+' if u else ''}" for (i, u) in _cards(p.draw_pile).elements()),
+        "discard": sorted(f"{i}{'+' if u else ''}" for (i, u) in _cards(p.discard_pile).elements()),
+        "exhaust": sorted(f"{i}{'+' if u else ''}" for (i, u) in _cards(p.exhaust_pile).elements()),
+        "enemies": [{"id": str(e.enemy_id), "hp": e.current_hp, "block": e.block, "status": _statuses(e)} for e in cs.enemies],
+    }
+
+def is_random_step(before : CombatState, predicted : CombatState, actions : list[dict]) -> bool:
+    """True when the simulated step involved a draw, a shuffle, an enemy turn or a random card, so hand
+    contents (and what follows from them) legitimately differ from the real game."""
+    if any(a["action"] == "end_turn" for a in actions):
+        return True
+    if len(before.player.draw_pile) != len(predicted.player.draw_pile):
+        return True
+    for a in actions:
+        if a["action"] == "use_potion" and a.get("potion_id") in SHUFFLING_POTIONS:
+            return True         # the shuffle and the cards drawn after it are the game's own order
+        if a["action"] == "play_card":
+            card = before.player.hand[a["card_index"]] if a["card_index"] < len(before.player.hand) else None
+            if card is not None and (card.card_id in RANDOM_CARDS or (card.card_id in RANDOM_UNLESS_UPGRADED and not card.is_upgraded)
+                                     or (card.type == CardType.Attack and StatusId.CALAMITY in before.player.status)):
+                return True
+    return False
+
+def is_unpredictable_step(before : CombatState, actions : list[dict]) -> bool:
+    """True when the step played a card whose result the sim cannot know: Havoc plays the top card of the draw pile, and unless
+    the agent knows that card (`known_top`) the game's choice is a different one than the sim's guess."""
+    for a in actions:
+        if a["action"] == "use_potion" and a.get("potion_id") == "DISTILLED_CHAOS" and before.player.known_top == 0:
+            return True         # it plays the top cards of the draw pile too
+        if a["action"] == "play_card" and a["card_index"] < len(before.player.hand):
+            if before.player.hand[a["card_index"]].card_id == CardId.HAVOC and before.player.known_top == 0:
+                return True
+            if before.player.hand[a["card_index"]].card_id == CardId.ABUNDANCE:
+                return True         # three random Powers are offered: the sim cannot know them, and the game waits on its pick screen
+    return False
+
+def is_stampede_step(before : CombatState, actions : list[dict]) -> bool:
+    """True when the step ends a turn under Stampede with more than one kind of Attack in hand: the game plays a random one of them, which is
+    checked like a random target (the sim replays the step until its pick matches the game's) instead of being skipped."""
+    if any(a["action"] == "end_turn" for a in actions) and StatusId.STAMPEDE in before.player.status:
+        attacks = {c.card_id for c in before.player.hand if c.type == CardType.Attack and not c.unplayable}
+        return len(attacks) > 1
+    for a in actions:               # Uproar plays a random Attack of the draw pile after its hits: the same kind of pick
+        if a["action"] == "play_card" and 0 <= a.get("card_index", -1) < len(before.player.hand) and before.player.hand[a["card_index"]].card_id == CardId.UPROAR:
+            attacks = {c.card_id for c in before.player.draw_pile if c.type == CardType.Attack and not c.unplayable}
+            return len(attacks) > 1
+    return False
+
+def some_target_roll_matches(before : CombatState, actions : list[dict], actual : CombatState, random_step : bool, tries : int = 300) -> bool:
+    """Random targets change how much damage is done when the enemies differ (Vulnerable on one of them), so the totals alone are not
+    enough: replay the actions with fresh random targets until one outcome matches the game exactly."""
+    from sts2_lite.combat import CombatState, CombatSimulator, IllegalActionError
+    for _ in range(tries):
+        replay = CombatState.deepcopy(before)
+        simulator = CombatSimulator(replay)
+        try:
+            for action in actions:
+                simulator.perform_action(action)
+        except IllegalActionError:
+            return False        # the actions cannot be replayed here (a card choice made in between is not among them): nothing to match against
+        if not compare(replay, actual, random_step=random_step):
+            return True
+    return False
+
+def game_order_matches(before : CombatState, actions : list[dict], before_game : dict, actual : CombatState, tries : int = 20) -> bool:
+    """A step that draws, shuffles or plays from the draw pile depends on the draw order the sim does not know. The game's draw_pile list is in
+    draw order (first card = top), so replay the actions with the sim's pile in that order: when the outcome then matches the game exactly,
+    the engine was right and the difference was only the order."""
+    from sts2_lite.combat import CombatState, CombatSimulator, IllegalActionError
+    listed = (before_game.get("player") or {}).get("draw_pile") or []
+    if not listed:
+        return False
+    for _ in range(tries):             # a reshuffle during the step is random again: a few tries
+        replay = CombatState.deepcopy(before)
+        pile = replay.player.draw_pile
+        ordered = []
+        for entry in listed:
+            match = next((c for c in pile if c.card_id.name == entry["id"] and c.is_upgraded == entry.get("is_upgraded", False)), None)
+            if match is not None:
+                pile.remove(match)
+                ordered.append(match)
+        pile[:] = pile + ordered[::-1]          # the top of the pile is the end of the list
+        simulator = CombatSimulator(replay)
+        try:
+            for action in actions:
+                simulator.perform_action(action)
+        except IllegalActionError:
+            return False
+        if not compare(replay, actual, random_step=False):
+            return True
+    return False
+
+def _summed_enemy_diffs(predicted : CombatState, actual : CombatState) -> list[str]:
+    out = []
+    for field, get in (("hp", lambda e: e.current_hp), ("block", lambda e: e.block)):
+        a, b = sum(get(e) for e in predicted.enemies), sum(get(e) for e in actual.enemies)
+        if a != b:
+            out.append(f"enemies' total {field}: sim {a}, game {b}")
+    def total(cs):
+        sums : dict[str, int] = {}
+        for e in cs.enemies:
+            for name, amount in _statuses(e).items():
+                sums[name] = sums.get(name, 0) + amount
+        return sums
+    out += _dict_diff("enemies' total status", total(predicted), total(actual))
+    return out
+
+def _multiset_diff(name : str, expected : Counter, actual : Counter) -> list[str]:
+    out = []
+    missing, extra = expected - actual, actual - expected
+    if missing or extra:
+        out.append(f"{name}: sim has {dict(missing) or '-'} that the game lacks; game has {dict(extra) or '-'} that the sim lacks")
+    return out
+
+def _dict_diff(name : str, expected : dict, actual : dict) -> list[str]:
+    out = []
+    for key in sorted(set(expected) | set(actual)):
+        if expected.get(key, 0) != actual.get(key, 0):
+            out.append(f"{name} {key}: sim {expected.get(key, 0)}, game {actual.get(key, 0)}")
+    return out
+
+def _fresh_spawn_hp_is_random(pe, ae, ascension : int = 0) -> bool:
+    """A monster that has just appeared with unhurt, in-range HP (Wriggler 17-21, 18-22 from Ascension 8): the game rolled it, the sim sampled its own."""
+    spawn = SPAWN_HP.get(re.sub(r"_\d+$", "", str(ae.enemy_id)))
+    if spawn is None:
+        return False
+    low, high = spawn[2:] if ascension >= TOUGH_ASCENSION else spawn[:2]
+    if str(ae.enemy_id).startswith("TOUGH_EGG"):
+        hatchling = HATCHLING_HP[1 if ascension >= TOUGH_ASCENSION else 0]
+        low, high = min(low, *hatchling), max(high, *hatchling)     # a hatched egg keeps its id, with a hatchling's HP
+    # the rolled max HP differs, the damage taken since the spawn (max - current) must not
+    # (a Wriggler hit by the rest of a Whirlwind on the turn it appeared)
+    return all(low <= e.max_hp <= high for e in (pe, ae)) and pe.max_hp - pe.current_hp == ae.max_hp - ae.current_hp
+
+# Relics whose counter is only what the game shows on the relic (the turn it is on): the sim does not keep it, and what the relic does is compared in the HP it takes
+COUNTER_NOT_COMPARED = frozenset({"STONE_CALENDAR"})
+
+COUNTER_ZERO_IS_NONE = {"PAELS_LEGION"}        # the game hides a cooldown that has run out (ShowCounter): 0 and no counter are the same
+
+def _shown_counter(relic, inst):
+    if relic.name == "METRONOME" and inst.counter is not None and inst.counter >= 7:
+        return None             # Metronome.ShowCounter: hidden once its 7 orbs are channeled (and shown only while it flashes)
+    return None if inst.counter == 0 and relic.name in COUNTER_ZERO_IS_NONE else inst.counter
+
+def compare(predicted : CombatState, actual : CombatState, random_step : bool = False, random_target : bool = False) -> list[str]:
+    """Differences between the simulated state and the game's. With `random_step` only what no draw
+    or shuffle can change is checked as exact: the cards the player owns in total and the exhaust pile
+    (a random exhaust that took another card of the same deck is not a difference). With `random_target` and several enemies the sim
+    and the game hit different ones: hit points, block and statuses are compared summed over the enemies instead of one by one."""
+    diffs : list[str] = []
+    pp, ap = predicted.player, actual.player
+    for field, a, b in (("hp", pp.current_hp, ap.current_hp), ("max hp", pp.max_hp, ap.max_hp),
+                        ("block", pp.block, ap.block), ("energy", predicted.energy, actual.energy), ("stars", pp.stars, ap.stars),
+                        ("round", predicted.turn_number, actual.turn_number)):
+        if a != b:
+            diffs.append(f"player {field}: sim {a}, game {b}")
+    diffs += _dict_diff("player status", _statuses(pp), _statuses(ap))
+
+    if len(predicted.enemies) != len(actual.enemies):
+        diffs.append(f"enemy count: sim {len(predicted.enemies)}, game {len(actual.enemies)}")
+    if random_target and len(predicted.enemies) > 1 and len(predicted.enemies) == len(actual.enemies):
+        diffs += _summed_enemy_diffs(predicted, actual)
+    for i, (pe, ae) in enumerate(zip(predicted.enemies, actual.enemies)):
+        if random_target and len(predicted.enemies) > 1 and len(predicted.enemies) == len(actual.enemies):
+            break
+        label = f"enemy {i} ({ae.enemy_id})"
+        if pe.current_hp != ae.current_hp and not _fresh_spawn_hp_is_random(pe, ae, predicted.ascension):
+            diffs.append(f"{label} hp: sim {pe.current_hp}, game {ae.current_hp}")
+        if pe.block != ae.block:
+            diffs.append(f"{label} block: sim {pe.block}, game {ae.block}")
+        diffs += _dict_diff(f"{label} status", _statuses(pe), _statuses(ae))
+
+    for relic, inst in pp.relics.items():
+        other = ap.relics.get(relic)
+        if other is None:
+            diffs.append(f"relic {relic.name}: in the sim but not loaded from the game")
+        elif (_shown_counter(relic, inst) != _shown_counter(relic, other) and relic.name not in COUNTER_NOT_COMPARED) or inst.used != other.used:
+            diffs.append(f"relic {relic.name}: sim counter {inst.counter} used {inst.used}, game counter {other.counter} used {other.used}")
+
+    everything = lambda p: _cards(p.hand) + _cards(p.draw_pile) + _cards(p.discard_pile)
+    diffs += _multiset_diff("cards owned (hand+draw+discard)", everything(pp), everything(ap))
+    diffs += _multiset_diff("exhaust pile", _cards(pp.exhaust_pile), _cards(ap.exhaust_pile))
+    if random_step and any(d.startswith("cards owned") for d in diffs) and any(d.startswith("exhaust pile") for d in diffs) \
+            and everything(pp) + _cards(pp.exhaust_pile) == everything(ap) + _cards(ap.exhaust_pile):
+        # a random exhaust (Cinder, Havoc, True Grit) took a different card: the same deck, split differently between the piles
+        diffs = [d for d in diffs if not d.startswith(("cards owned", "exhaust pile"))]
+    if random_step and any(d.startswith("cards owned") for d in diffs):
+        # Jack of All Trades generates random colorless cards; Jackpot, Stoke, Splash and the like random character ones: the same number of cards, but a different pick
+        sim_owned, game_owned = everything(pp), everything(ap)
+        extra_cards = (sim_owned - game_owned) + (game_owned - sim_owned)
+        from sts2_lite.card.tables import combat_pool, splash_pool
+        pool = set(COLORLESS_CARDS) | set(combat_pool(pp.character)) | set(splash_pool(pp.character))
+        if sum(sim_owned.values()) == sum(game_owned.values()) and all(CardId[name.split("[")[0]] in pool for name, _ in extra_cards):
+            diffs = [d for d in diffs if not d.startswith("cards owned")]
+    if random_step and predicted.energy != actual.energy:
+        # Drum of Battle gives energy when it is exhausted: a random exhaust (Toasty Mittens off a reshuffled pile) that took it in the
+        # sim but another card in the game (or the reverse) moves the energy by what the Drum gives
+        drum = lambda p: sum((3 if c.is_upgraded else 2) for c in p.exhaust_pile if c.card_id == CardId.DRUM_OF_BATTLE)
+        # Void costs 1 energy when it is drawn: a different random draw (one more or fewer Void in the hand) moves the energy by that
+        void = lambda p: sum(1 for c in p.hand if c.card_id == CardId.VOID)
+        explained = drum(pp) - drum(ap) + void(ap) - void(pp)
+        if predicted.energy - actual.energy == explained != 0:
+            diffs = [d for d in diffs if not d.startswith("player energy")]
+    if random_step and StatusId.HELLRAISER in {**pp.status, **ap.status} and _cards(pp.hand) != _cards(ap.hand):
+        # Hellraiser plays every Strike the moment it is drawn: a different random draw means different Strikes were played,
+        # so the damage dealt, what the enemies then did and the counters of the relics that count plays all diverge
+        diffs = [d for d in diffs if not d.startswith(("player hp", "player block", "player energy", "enemy", "relic"))]
+    if len(pp.hand) != len(ap.hand) and not random_step:
+        diffs.append(f"hand size: sim {len(pp.hand)}, game {len(ap.hand)}")
+    if not random_step:
+        diffs += _multiset_diff("hand", _cards(pp.hand), _cards(ap.hand))
+        diffs += _multiset_diff("discard pile", _cards(pp.discard_pile), _cards(ap.discard_pile))
+        diffs += _multiset_diff("draw pile", _cards(pp.draw_pile), _cards(ap.draw_pile))
+        sim_costs = Counter((c.card_id.name, c.current_cost(pp)) for c in pp.hand)
+        game_costs = Counter((c.card_id.name, c.current_cost(ap)) for c in ap.hand)
+        diffs += _multiset_diff("hand costs", sim_costs, game_costs)
+    return diffs
