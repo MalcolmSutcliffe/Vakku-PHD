@@ -11,6 +11,7 @@ mkdir -p "$WS/content"
 rm -rf "$WS/content"/*
 cp "$SRC/Vakku_PHD.dll" "$SRC/Vakku_PHD.json" "$WS/content/"
 cp -r "$SRC/sidecar" "$WS/content/sidecar"
+[ -d "$SRC/localization" ] && cp -r "$SRC/localization" "$WS/content/localization"
 chmod -x "$WS/content/sidecar/run"        # a Workshop download may not keep the executable bit; the mod has to cope
 cp "$HERE/Vakku-PHD/Vakku_PHD/mod_image.png" "$WS/image.png"
 [ -f "$WS/workshop.json" ] || cat > "$WS/workshop.json" <<'J'

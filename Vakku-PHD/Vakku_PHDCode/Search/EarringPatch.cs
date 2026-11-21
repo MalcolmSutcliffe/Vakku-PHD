@@ -36,7 +36,7 @@ public static class EarringPlayPatch
 
         earring.Flash();
         int startTurnAtEntry = earring.Owner.PlayerCombatState.TurnNumber;
-        LastFight.Begin();
+        LastFight.Begin(combatState);
         int cardsPlayed = 0;
         bool hitCap;
         using (CardSelectCmd.PushSelector(new VakuuCardSelector()))
@@ -69,6 +69,7 @@ public static class EarringPlayPatch
                     catch (Exception e)
                     {
                         MainFile.Logger.Warn($"search failed, vanilla plays this card: {e.Message}");
+                        LastFight.Event($"search failed, vanilla played the card: {e.Message}");
                         if (e is InvalidOperationException) searchWorks = false;
                     }
                 }

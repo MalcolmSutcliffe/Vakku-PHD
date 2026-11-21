@@ -12,6 +12,7 @@ public static class SidecarClient
     private static SidecarProcess? _process;
     private static Task<bool>? _starting;
     private static bool _failed;
+    public static string? Hello { get; private set; }
 
     public static Task<bool> EnsureStarted() => _starting ??= StartAsync();
 
@@ -21,12 +22,14 @@ public static class SidecarClient
         {
             _process = new SidecarProcess();
             string hello = await _process.StartAsync(TimeSpan.FromSeconds(15));
+            Hello = hello;
             MainFile.Logger.Info($"sidecar up on port {_process.Port}: {hello}");
             return true;
         }
         catch (Exception e)
         {
             _failed = true;
+            LastFight.Event($"sidecar failed to start: {e.Message}");
             MainFile.Logger.Error($"sidecar failed to start; the Earring plays like vanilla: {e.Message}");
             return false;
         }

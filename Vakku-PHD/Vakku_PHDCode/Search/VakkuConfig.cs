@@ -239,8 +239,17 @@ public class VakkuConfig : SimpleModConfig
     [ConfigSlider(0, 10, 0.5, Format = "{0:0.0} HP")]
     public static double GoopyGrowthHp { get; set; } = 1.0;
 
+    [ConfigSection("BugReport")]
+    [ConfigButton("SaveReport")]
+    public static void SaveLastFight()
+    {
+        var path = BugReport.Save();
+        if (path != null) Godot.OS.ShellShowInFileManager(path);
+    }
+
     [ConfigSection("Advanced", CollapsedByDefault = true)]
     [ConfigSlider(0, 1000, 50, Format = "{0}")]
     public static int PairedScenarios { get; set; } = 300;
+    public static bool ShowFightButton { get; set; } = false;
 
 }
