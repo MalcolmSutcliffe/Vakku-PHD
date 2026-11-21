@@ -33,6 +33,13 @@ ORDER_MAX_ROUNDS = 4             # the scenarios of the order check are repeated
 def is_end_turn(move_id : tuple) -> bool:
     return move_id[0] == "action" and json.loads(move_id[1]).get("action") == "end_turn"
 
+def is_potion(move_id : tuple) -> bool:
+    return move_id[0] == "action" and json.loads(move_id[1]).get("action") == "use_potion"
+
+def potion_position(moves : list) -> int:
+    """How many plays come before the first potion in `moves` (a large number when there is none)."""
+    return next((i for i, m in enumerate(moves) if is_potion(m)), 10**6)
+
 def is_choice(move_id : tuple) -> bool:
     """A move id of the answer to a pending card choice."""
     if move_id[0] == "choose_card":
@@ -74,6 +81,8 @@ class OrderCheck:
         if not line:
             return None                                     # the picked move is the random play: it is already played first
         self.can_draw_first = self.tail is not None and not is_end_turn(self.tail)
+        self.potions_added = 0
+        line = self._with_potions(line)
         units = self._units(line)
         if len(units) > ORDER_MAX_UNITS or (len(units) < 2 and not self.can_draw_first):
             return None
@@ -93,9 +102,51 @@ class OrderCheck:
             "draws_first" : chosen.draws_first,
             "scenarios" : total,
             "plays" : len(units),
+            "potions_added" : self.potions_added,
             "distinct" : len(orders),
             "compared" : [{"first" : r.first, "draws_first" : r.draws_first, "gain" : r.gain, "se" : r.se} for r in replays[1:]],
         }
+
+    # ---- 0. the potions that belong in the turn
+
+    def _with_potions(self, line : list) -> list:
+        """The tree's line, with a potion appended when drinking it this turn beats keeping it. The tree seldom puts a potion in the
+        middle of its line (its value shows once the potion's buff has something to act on, and the rollouts are noisy), so a potion
+        that is going to be drunk this turn is otherwise drunk after the cards it should have buffed. Each held potion is replayed
+        at the end of the line against the line without it, under the same scenarios, and has to clear the potion bar; the orders
+        that follow then try it first."""
+        mcts, config = self.mcts, self.config
+        gate = config.potions
+        if not mcts._potions_on:
+            return line
+        c = CombatSimulator(CombatState.deepcopy(self.root))
+        for move in line:
+            action = mcts._find_move(c, move)
+            if action is None or c.is_over:
+                return line
+            c.perform_action(action)
+        if c.is_over:
+            return line
+        held = [mcts._move_id_of(c, a) for a in c.get_available_actions() if a["action"] == "use_potion"]
+        held = [m for m in held if m not in line]
+        if not held:
+            return line
+        tail = [self.tail] if self.tail is not None else []
+        seeds = [rng.randrange(1 << 30) for _ in range(config.paired_scenarios)]
+        saved = rng.getstate()
+        try:
+            with Rollouts(mcts, self.root, config.check_workers) as rollouts:
+                base = rollouts.run([(line + tail, s) for s in seeds])
+                for potion in held:
+                    rated = rollouts.run([(line + [potion] + tail, s) for s in seeds])
+                    gain, se = spread([r - b for r, b in zip(rated, base)])
+                    if gain > gate.potion_z * se + gate.potion_min_gain_hp / max(1, mcts._starting_hp):
+                        line = line + [potion]
+                        self.potions_added += 1
+                        break               # one potion at a time: the next search looks again
+        finally:
+            rng.setstate(saved)
+        return line
 
     # ---- 1. the orders the line's plays can be made in
 
@@ -240,6 +291,15 @@ class OrderCheck:
         by more than TIE_MARGIN, nor significantly), the one that draws first."""
         ahead = [r for r in replays[1:] if r.gain > 0 and r.gain > PAIRED_Z * r.se]
         best = max(ahead, key=lambda r: r.gain - PAIRED_Z * r.se) if ahead else replays[0]
+        near = []
+        for r in replays:
+            gap, se = spread([a - b for a, b in zip(r.diffs, best.diffs)])
+            if gap >= -min(TIE_MARGIN, PAIRED_Z * se):
+                near.append(r)
+        if any(potion_position(r.moves) < 10**6 for r in near):
+            # a potion's buff is for the plays after it: among the orders tied with the best, the one that drinks it earliest (the draw
+            # first, as below, when that is tied too)
+            return min(near, key=lambda r: (not r.draws_first, potion_position(r.moves), -r.gain))
         tied = []
         for r in replays:
             if not r.draws_first:

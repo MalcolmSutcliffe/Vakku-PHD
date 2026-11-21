@@ -124,7 +124,8 @@ public static class EarringPlayPatch
         var handNow = PileType.Hand.GetPile(player).Cards.Select(c => c.Id.Entry);
         int sims = reply.Stats.ValueKind == JsonValueKind.Object && reply.Stats.TryGetProperty("num_sims", out var ns) && ns.ValueKind == JsonValueKind.Number ? ns.GetInt32() : -1;
         MainFile.Logger.Info($"search ({ms} ms, {sims} sims): {reply.Action} hand=[{string.Join(", ", handNow)}] energy={player.PlayerCombatState.Energy} {Summary(reply.Stats)}");
-        if (kind == "end_turn") return (null, null, null, true);
+        string note = ReplacedBy(reply.Stats);
+        if (kind == "end_turn") { DebugOverlay.Final(null, true, note); return (null, null, null, true); }
         if (kind == "use_potion") return UsePotion(player, reply.Action);
         if (kind != "play_card") throw new InvalidDataException($"search answered {kind}; only cards and potions are used here");
 
@@ -132,6 +133,7 @@ public static class EarringPlayPatch
         var hand = PileType.Hand.GetPile(player).Cards;
         if (index < 0 || index >= hand.Count) throw new InvalidDataException($"card_index {index} is not in the hand");
         var card = hand[index];
+        DebugOverlay.Final(card, false, note);
         if (!card.CanPlay()) throw new InvalidDataException($"{card.Id.Entry} cannot be played now");
 
         Creature? target = null;
@@ -212,13 +214,21 @@ public static class EarringPlayPatch
         }
     }
 
+    /// <summary>"(paired)" or "(order)" when a check after the tree search changed the answer.</summary>
+    private static string ReplacedBy(JsonElement stats)
+    {
+        if (stats.ValueKind != JsonValueKind.Object) return "";
+        bool Replaced(string name) => stats.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Object && v.TryGetProperty("replaced", out var r) && r.ValueKind == JsonValueKind.True;
+        return Replaced("order") ? "(order check)" : Replaced("paired") ? "(paired check)" : "";
+    }
+
     private static string Summary(JsonElement stats)
     {
         if (stats.ValueKind != JsonValueKind.Object) return "";
         string Get(string n) => stats.TryGetProperty(n, out var v) ? v.ToString() : "-";
         bool paired = stats.TryGetProperty("paired", out var p) && p.ValueKind == JsonValueKind.Object;
         bool order = stats.TryGetProperty("order", out var o) && o.ValueKind == JsonValueKind.Object;
-        return $"exit={Get("exit_reason")} paired={(paired ? "yes" : "no")} order={(order ? "yes" : "no")}";
+        return $"exit={Get("exit_reason")} paired={(paired ? "yes" : "no")} order={(order ? "yes" : "no")} {ReplacedBy(stats)}";
     }
 
     private static Creature? VanillaTarget(WhisperingEarring? earring, CardModel card, ICombatState combat, Player? owner = null)

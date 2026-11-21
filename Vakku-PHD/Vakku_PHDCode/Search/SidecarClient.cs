@@ -49,9 +49,21 @@ public static class SidecarClient
             ["use_potions"] = settings.UsePotions,
         };
         using var content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(settings.SearchSeconds + 5));
-        using var response = await Http.PostAsync($"{_process!.BaseUrl}/search", content, cts.Token);
-        string text = await response.Content.ReadAsStringAsync(cts.Token);
+        // A search may take several budgets: with potions allowed it runs twice when the first line looks bad, and the paired and order checks follow.
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(settings.SearchSeconds * 3 + 10));
+        string text;
+        System.Net.Http.HttpResponseMessage response;
+        try
+        {
+            response = await Http.PostAsync($"{_process!.BaseUrl}/search", content, cts.Token);
+            text = await response.Content.ReadAsStringAsync(cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            throw new TimeoutException($"the search took longer than {clock.Elapsed.TotalSeconds:0.0} s (budget {settings.SearchSeconds} s)");
+        }
+        using var _ = response;
         if (!response.IsSuccessStatusCode)
             throw new InvalidOperationException($"sidecar refused ({(int)response.StatusCode}): {text}");
         using var doc = JsonDocument.Parse(text);

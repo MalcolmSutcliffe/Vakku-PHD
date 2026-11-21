@@ -474,6 +474,10 @@ class sts2_MCTS:
         return line, None
 
     @staticmethod
+    def _move_id_of(c : CombatSimulator, action : dict) -> tuple:
+        return _move_id(c, action)
+
+    @staticmethod
     def _find_move(c : CombatSimulator, move_id : tuple) -> dict | None:
         return next((a for a in c.get_available_actions() if _move_id(c, a) == move_id), None)
 
