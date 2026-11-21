@@ -121,6 +121,7 @@ class PotionParams:
     kept_potion_loss_bonus : float = 0.02   # reward an unfinished or lost line (player still alive) gains for each potion still held (gated search only), so holding is not worth nothing when the line looks bad
     rollout_use : bool = True               # while potions are allowed, the rollouts drink one when the turn would otherwise end with this much danger (below), so "hold it" lines are credited with a later use
     rollout_danger : float = 0.3            # ... the damage still to come through the block, as a share of the current HP
+    drink_when_dying : bool = True          # the pick is to end the turn and every rollout through it is lost: a held potion is drunk instead
     potion_z : float = 2.0                  # a potion move is only played when the paired check finds it ahead of every non-potion line by this many standard errors ...
     potion_min_gain_hp : float = 2.0        # ... and by at least this many HP (a share of the starting HP in reward units)
 

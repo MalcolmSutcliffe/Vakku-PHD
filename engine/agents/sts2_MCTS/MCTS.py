@@ -167,7 +167,12 @@ class sts2_MCTS:
             if plain_check is not None and plain_check["replaced"]:
                 move = plain_check["action"]
 
+        dying = self._dying_drink(move)
+        if dying is not None:
+            move = dying
+
         stats = { 
+            "dying_drink" : dying is not None,
             "plain_check" : None if plain_check is None else {k: v for k, v in plain_check.items() if k != "action"},
             "children": [{"action": c.action, "visits": c.visits, "q": c.total_reward / c.visits if c.visits else math.nan} for c in self._root_node.children],
             "num_sims" : self._num_sims,
@@ -182,6 +187,28 @@ class sts2_MCTS:
                 }
         stats["time_taken"] = time.perf_counter() - search_started
         return move, stats
+
+    def _dying_drink(self, move : dict) -> dict | None:
+        """Ending the turn is the pick and ending it kills the player (one step through the sim: the enemies' turn): a potion is drunk
+        instead, whatever the tree thinks of it, since nothing is saved by keeping one. The potion that won most often, then the one
+        rated best, goes first; the next search drinks the next."""
+        if move.get("action") != "end_turn" or not self._search_config.potions.drink_when_dying:
+            return None
+        potions = [c for c in self._root_node.children if c.action is not None and c.action.get("action") == "use_potion"]
+        if not potions or not self._end_turn_kills(move):
+            return None
+        best = max(potions, key=lambda c: (c.wins / c.visits if c.visits else 0.0, c.total_reward / c.visits if c.visits else -math.inf))
+        return best.action
+
+    def _end_turn_kills(self, move : dict) -> bool:
+        """The player is dead after `move` (end turn) is played from the root state."""
+        saved = rng.getstate()
+        try:
+            c = CombatSimulator(CombatState.deepcopy(self._root_node.state))
+            c.perform_action(move)
+            return c.combat_state.player.current_hp <= 0
+        finally:
+            rng.setstate(saved)
 
     def _plain_check(self, combat_state : CombatState, move : dict) -> dict | None:
         """A potion pick is checked against a proper search without potions. The tree that drinks has looked deeply along the potion's line, while the
